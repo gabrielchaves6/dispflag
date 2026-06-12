@@ -11,32 +11,35 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Raw flag values not yet stable in windows-rs 0.58
+// Raw flag values not stable in windows-rs 0.58
 const QDC_VIRTUAL_MODE_AWARE: u32 = 0x0000_0010;
 const SDC_VIRTUAL_MODE_AWARE: u32 = 0x8000_0000;
-const SDC_TOPOLOGY_INTERNAL_RAW: u32 = 0x0000_0001;
-const SDC_APPLY_RAW: u32 = 0x0000_0080;
-const SDC_USE_SUPPLIED_RAW: u32 = 0x0000_0020;
-const SDC_SAVE_TO_DB_RAW: u32 = 0x0000_0100;
+const SDC_TOPOLOGY_INTERNAL_V: u32 = 0x0000_0001;
+const SDC_APPLY_V: u32 = 0x0000_0080;
+const SDC_USE_SUPPLIED_V: u32 = 0x0000_0020;
+const SDC_SAVE_TO_DB_V: u32 = 0x0000_0100;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const CMD_TOGGLE: usize = 1;
 const CMD_EXIT: usize = 2;
 
-// 0 = native, 1 = 4K virtual
-static mut G_MODE: u32 = 0;
+static mut G_MODE: u32 = 0; // 0 = native HD, 1 = 4K virtual
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
 // ---------- Registry ----------
 
 unsafe fn reg_read() -> u32 {
     let path = w("Software\\DispFlag");
-    let mut hk = HKEY(0);
+    let nm = w("Mode");
+    let mut hk = HKEY::default();
     if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut hk).is_ok() {
-        let nm = w("Mode");
         let mut val = 0u32;
         let mut sz = 4u32;
         let ok = RegQueryValueExW(
@@ -51,12 +54,9 @@ unsafe fn reg_read() -> u32 {
 
 unsafe fn reg_write(val: u32) {
     let path = w("Software\\DispFlag");
-    let mut hk = HKEY(0);
-    if RegCreateKeyExW(
-        HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, PCWSTR::null(),
-        REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut hk, None,
-    ).is_ok() {
-        let nm = w("Mode");
+    let nm = w("Mode");
+    let mut hk = HKEY::default();
+    if RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), &mut hk).is_ok() {
         let _ = RegSetValueExW(hk, PCWSTR(nm.as_ptr()), 0, REG_DWORD, Some(&val.to_le_bytes()));
         let _ = RegCloseKey(hk);
     }
@@ -85,17 +85,18 @@ unsafe fn apply_4k() -> bool {
         }
     }
     let sf = SET_DISPLAY_CONFIG_FLAGS(
-        (SDC_APPLY_RAW | SDC_USE_SUPPLIED_RAW | SDC_SAVE_TO_DB_RAW | SDC_VIRTUAL_MODE_AWARE) as i32,
+        SDC_APPLY_V | SDC_USE_SUPPLIED_V | SDC_SAVE_TO_DB_V | SDC_VIRTUAL_MODE_AWARE,
     );
-    SetDisplayConfig(np, paths.as_ptr(), nm, modes.as_ptr(), sf) == ERROR_SUCCESS
+    SetDisplayConfig(
+        Some(&paths[..np as usize]),
+        Some(&modes[..nm as usize]),
+        sf,
+    ) == 0
 }
 
 unsafe fn apply_native() -> bool {
-    let sf = SET_DISPLAY_CONFIG_FLAGS(
-        (SDC_APPLY_RAW | SDC_TOPOLOGY_INTERNAL_RAW | SDC_SAVE_TO_DB_RAW) as i32,
-    );
-    // null path/mode arrays → reset to default internal topology
-    SetDisplayConfig(0, std::ptr::null(), 0, std::ptr::null(), sf) == ERROR_SUCCESS
+    let sf = SET_DISPLAY_CONFIG_FLAGS(SDC_APPLY_V | SDC_TOPOLOGY_INTERNAL_V | SDC_SAVE_TO_DB_V);
+    SetDisplayConfig(None, None, sf) == 0
 }
 
 // ---------- Tray icon (GDI badge) ----------
@@ -108,7 +109,7 @@ unsafe fn make_icon(mode: u32) -> HICON {
     ReleaseDC(None, sdc);
     let prev = SelectObject(dc, bmp);
 
-    let bg = if mode == 1 { RGB(0, 190, 90) } else { RGB(85, 85, 85) };
+    let bg = if mode == 1 { rgb(0, 190, 90) } else { rgb(85, 85, 85) };
     let br = CreateSolidBrush(bg);
     let rc = RECT { left: 0, top: 0, right: sz, bottom: sz };
     FillRect(dc, &rc, br);
@@ -124,7 +125,7 @@ unsafe fn make_icon(mode: u32) -> HICON {
         PCWSTR(fn_w.as_ptr()),
     );
     let prev_font = SelectObject(dc, font);
-    SetTextColor(dc, RGB(255, 255, 255));
+    SetTextColor(dc, rgb(255, 255, 255));
     SetBkMode(dc, TRANSPARENT);
     let mut lbl: Vec<u16> = (if mode == 1 { "4K" } else { "HD" }).encode_utf16().collect();
     let mut r = rc;
@@ -141,7 +142,7 @@ unsafe fn make_icon(mode: u32) -> HICON {
         hbmMask: mask,
         hbmColor: bmp,
     };
-    let ico = CreateIconIndirect(&ii);
+    let ico = CreateIconIndirect(&ii).unwrap_or_default();
     DeleteObject(mask);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -163,7 +164,7 @@ unsafe fn tray_op(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) {
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = ico;
-    let tip = if G_MODE == 1 { "DispFlag — 4K Virtual active" } else { "DispFlag — Native (HD)" };
+    let tip = if G_MODE == 1 { "DispFlag \u{2014} 4K Virtual active" } else { "DispFlag \u{2014} Native (HD)" };
     let tv: Vec<u16> = tip.encode_utf16().chain(Some(0)).collect();
     let n = tv.len().min(128);
     nid.szTip[..n].copy_from_slice(&tv[..n]);
@@ -171,7 +172,7 @@ unsafe fn tray_op(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) {
     DestroyIcon(ico);
 }
 
-// ---------- Menu ----------
+// ---------- Menu & toggle ----------
 
 unsafe fn show_menu(hwnd: HWND) {
     let hm = CreatePopupMenu().unwrap();
@@ -231,9 +232,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             WM_COMMAND => {
                 match wp.0 & 0xFFFF {
                     CMD_TOGGLE => do_toggle(hwnd),
-                    CMD_EXIT => {
-                        let _ = DestroyWindow(hwnd);
-                    }
+                    CMD_EXIT => { let _ = DestroyWindow(hwnd); }
                     _ => {}
                 }
                 LRESULT(0)
@@ -247,9 +246,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 
 fn main() {
     unsafe {
-        // Single instance guard
         let mn = w("DispFlagSingleInstance");
-        let mtx = CreateMutexW(None, true, PCWSTR(mn.as_ptr())).unwrap_or_default();
+        let mtx = CreateMutexW(None, BOOL(1), PCWSTR(mn.as_ptr())).unwrap_or_default();
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if !mtx.is_invalid() { let _ = CloseHandle(mtx); }
             return;
@@ -257,7 +255,8 @@ fn main() {
 
         G_MODE = reg_read();
 
-        let hinst = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+        let hmod = GetModuleHandleW(None).unwrap();
+        let hinst = HINSTANCE(hmod.0);
         let cn = w("DispFlagWnd");
         let wc = WNDCLASSEXW {
             cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
@@ -275,14 +274,11 @@ fn main() {
             PCWSTR(tn.as_ptr()),
             WS_OVERLAPPED,
             0, 0, 0, 0,
-            None, None, Some(hinst), None,
+            None, None, hmod, None,
         )
         .unwrap();
 
-        // Re-apply 4K if it was active at last exit
-        if G_MODE == 1 {
-            apply_4k();
-        }
+        if G_MODE == 1 { apply_4k(); }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
