@@ -64,7 +64,31 @@ unsafe fn reg_write(val: u32) {
 
 // ---------- Display switching ----------
 
+// Scan EnumDisplaySettings for a mode >= 3840x2160 (present when NVIDIA DSR is enabled)
+unsafe fn find_4k_devmode() -> Option<DEVMODEW> {
+    let mut i = 0u32;
+    let mut dm: DEVMODEW = mem::zeroed();
+    dm.dmSize = mem::size_of::<DEVMODEW>() as u16;
+    while EnumDisplaySettingsW(PCWSTR::null(), ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm).as_bool() {
+        if dm.dmPelsWidth >= 3840 && dm.dmPelsHeight >= 2160 {
+            return Some(dm);
+        }
+        i += 1;
+    }
+    None
+}
+
 unsafe fn apply_4k() -> bool {
+    // Primary: ChangeDisplaySettingsExW with an enumerated DSR/virtual 4K mode
+    if let Some(dm) = find_4k_devmode() {
+        if ChangeDisplaySettingsExW(PCWSTR::null(), Some(&dm), None, CDS_UPDATEREGISTRY, None)
+            == DISP_CHANGE_SUCCESSFUL
+        {
+            return true;
+        }
+    }
+
+    // Fallback: SetDisplayConfig virtual-mode API
     let qf = QUERY_DISPLAY_CONFIG_FLAGS(QDC_ONLY_ACTIVE_PATHS.0 | QDC_VIRTUAL_MODE_AWARE);
     let mut np = 0u32;
     let mut nm = 0u32;
@@ -95,6 +119,12 @@ unsafe fn apply_4k() -> bool {
 }
 
 unsafe fn apply_native() -> bool {
+    // Reset primary display to its default (native) resolution
+    if ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_UPDATEREGISTRY, None)
+        == DISP_CHANGE_SUCCESSFUL
+    {
+        return true;
+    }
     let sf = SET_DISPLAY_CONFIG_FLAGS(SDC_APPLY_V | SDC_TOPOLOGY_INTERNAL_V | SDC_SAVE_TO_DB_V);
     SetDisplayConfig(None, None, sf) == 0
 }
@@ -198,9 +228,12 @@ unsafe fn do_toggle(hwnd: HWND) {
         tray_op(hwnd, NIM_MODIFY);
     } else {
         let msg_w = w(concat!(
-            "Could not change display resolution.\n\n",
-            "Requires a GPU driver with virtual/scaled display mode support\n",
-            "(NVIDIA DSR, AMD VSR, or Windows virtual display stack)."
+            "Could not switch to 4K virtual resolution.\n\n",
+            "Your laptop has an NVIDIA Quadro P620. You need to enable DSR first:\n\n",
+            "1. Open NVIDIA Control Panel\n",
+            "2. Manage 3D Settings \u{2192} DSR - Factors \u{2192} check \u{22184}x (4.00x)\n",
+            "3. Click Apply\n\n",
+            "Then try again \u{2014} the 3840\u{d7}2160 mode will appear and DispFlag will use it."
         ));
         let title_w = w("DispFlag");
         MessageBoxW(hwnd, PCWSTR(msg_w.as_ptr()), PCWSTR(title_w.as_ptr()), MB_ICONWARNING | MB_OK);
